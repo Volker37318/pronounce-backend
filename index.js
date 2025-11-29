@@ -4,6 +4,9 @@ import cors from "cors";
 const app = express();
 app.use(express.json({ limit: "15mb" }));
 
+// Marker damit du sofort siehst, ob Koyeb wirklich den neuen Code fährt:
+const DEPLOY_MARKER = "DEPLOY_2025-11-29_v3";
+
 const {
   PORT = "8000",
   AZURE_SPEECH_KEY,
@@ -12,16 +15,15 @@ const {
   ALLOWED_ORIGINS = ""
 } = process.env;
 
+// Region normalized (wichtig für Endpoint!):
+const azureRegion = (AZURE_SPEECH_REGION || "").trim().toLowerCase();
+
 const allowedOrigins = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
 
 const corsOptions = {
   origin: (origin, cb) => {
-    // server-to-server / curl has no Origin
     if (!origin) return cb(null, true);
-
-    // if not configured yet: allow for now
     if (allowedOrigins.length === 0) return cb(null, true);
-
     if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"));
   },
@@ -33,8 +35,18 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-app.get("/health", (_, res) => {
-  res.json({ ok: true, service: "pronounce-backend" });
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "pronounce-backend",
+    marker: DEPLOY_MARKER,
+    env: {
+      hasPRONOUNCE_SECRET: !!(PRONOUNCE_SECRET || "").trim(),
+      hasAZURE_SPEECH_KEY: !!(AZURE_SPEECH_KEY || "").trim(),
+      azureRegion: azureRegion || "(missing)",
+      allowedOrigins
+    }
+  });
 });
 
 function base64ToBuffer(audioBase64) {
@@ -49,12 +61,17 @@ function detectContentType(audioBase64) {
   const m = /^data:([^;]+);base64,/.exec(audioBase64 || "");
   if (!m) return null;
   const mime = (m[1] || "").toLowerCase();
+
+  // Wichtig: MediaRecorder liefert in Chrome oft audio/webm;codecs=opus
+  if (mime.includes("webm")) return "audio/webm; codecs=opus";
   if (mime.includes("ogg")) return "audio/ogg; codecs=opus";
   if (mime.includes("wav")) return "audio/wav; codecs=audio/pcm; samplerate=16000";
+
   return mime;
 }
 
 function buildPronHeader({ referenceText, enableMiscue = true }) {
+  // MS Docs: REST short-audio accepts True/False strings for EnableMiscue. :contentReference[oaicite:0]{index=0}
   const payload = {
     ReferenceText: referenceText,
     GradingSystem: "HundredMark",
@@ -79,8 +96,10 @@ function extractBest(json) {
 
 app.post("/pronounce", async (req, res) => {
   try {
-    const secret = req.headers["x-pronounce-secret"];
-    if (!PRONOUNCE_SECRET || secret !== PRONOUNCE_SECRET) {
+    // Secret check
+    const secret = String(req.headers["x-pronounce-secret"] || "").trim();
+    const serverSecret = String(PRONOUNCE_SECRET || "").trim();
+    if (!serverSecret || secret !== serverSecret) {
       return res.status(401).json({ ok: false, error: "Unauthorized (bad secret)" });
     }
 
@@ -92,7 +111,7 @@ app.post("/pronounce", async (req, res) => {
       });
     }
 
-    if (!AZURE_SPEECH_KEY || !AZURE_SPEECH_REGION) {
+    if (!AZURE_SPEECH_KEY || !azureRegion) {
       return res.status(500).json({
         ok: false,
         error: "Missing env. Required: AZURE_SPEECH_KEY, AZURE_SPEECH_REGION"
@@ -100,16 +119,20 @@ app.post("/pronounce", async (req, res) => {
     }
 
     const audioBuf = base64ToBuffer(audioBase64);
+    if (!audioBuf || audioBuf.length < 2000) {
+      return res.status(400).json({ ok: false, error: "Audio too short/empty" });
+    }
 
-    // Azure REST short-audio: accept OGG/OPUS 16k or WAV/PCM 16k (default to WAV)
     const detected = detectContentType(audioBase64);
     const contentType =
-      detected === "audio/ogg; codecs=opus"
-        ? "audio/ogg; codecs=opus"
-        : "audio/wav; codecs=audio/pcm; samplerate=16000";
+      detected === "audio/webm; codecs=opus"
+        ? "audio/webm; codecs=opus"
+        : detected === "audio/ogg; codecs=opus"
+          ? "audio/ogg; codecs=opus"
+          : "audio/wav; codecs=audio/pcm; samplerate=16000";
 
     const endpoint =
-      `https://${AZURE_SPEECH_REGION}.stt.speech.microsoft.com` +
+      `https://${azureRegion}.stt.speech.microsoft.com` +
       `/speech/recognition/conversation/cognitiveservices/v1` +
       `?language=${encodeURIComponent(language)}` +
       `&format=detailed`;
@@ -124,7 +147,7 @@ app.post("/pronounce", async (req, res) => {
       headers: {
         Accept: "application/json",
         "Content-Type": contentType,
-        "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+        "Ocp-Apim-Subscription-Key": String(AZURE_SPEECH_KEY).trim(),
         "Pronunciation-Assessment": pronHeader
       },
       body: audioBuf
@@ -134,18 +157,29 @@ app.post("/pronounce", async (req, res) => {
     let json;
     try { json = JSON.parse(raw); } catch { json = { raw }; }
 
+    // Azure errors sauber sichtbar machen (und NICHT als 401 an Browser durchreichen)
     if (!azureResp.ok) {
-      return res.status(azureResp.status).json({
+      const hint =
+        azureResp.status === 401
+          ? "Azure 401: Key/Region passen nicht zur Speech-Ressource (oder falscher Key)."
+          : azureResp.status === 400
+            ? "Azure 400: oft Audioformat/Codec/zu lange oder ungültige Daten."
+            : "Siehe azureBody.";
+
+      return res.status(502).json({
         ok: false,
         error: "Azure request failed",
-        status: azureResp.status,
-        azure: json
+        azureStatus: azureResp.status,
+        hint,
+        azureBody: json
       });
     }
 
+    // Pronunciation scores sitzen typischerweise in NBest[0].PronunciationAssessment
     const best = extractBest(json);
-    const pronScore = Number(best?.PronScore ?? best?.PronunciationScore ?? best?.AccuracyScore ?? 0);
-    const overallScore = Math.round(pronScore);
+    const pa = best?.PronunciationAssessment || {};
+
+    const overallScore = Math.round(Number(pa?.PronScore ?? pa?.AccuracyScore ?? 0));
 
     return res.json({
       ok: true,
@@ -154,13 +188,13 @@ app.post("/pronounce", async (req, res) => {
       details: {
         targetText,
         language,
-        recognizedText: best?.Display || json?.DisplayText || "",
+        recognizedText: best?.Lexical || best?.Display || json?.DisplayText || "",
         scores: {
-          pronScore: best?.PronScore ?? null,
-          accuracyScore: best?.AccuracyScore ?? null,
-          fluencyScore: best?.FluencyScore ?? null,
-          completenessScore: best?.CompletenessScore ?? null,
-          prosodyScore: best?.ProsodyScore ?? null
+          pronScore: pa?.PronScore ?? null,
+          accuracyScore: pa?.AccuracyScore ?? null,
+          fluencyScore: pa?.FluencyScore ?? null,
+          completenessScore: pa?.CompletenessScore ?? null,
+          prosodyScore: pa?.ProsodyScore ?? null
         },
         words: Array.isArray(best?.Words) ? best.Words : [],
         recognitionStatus: json?.RecognitionStatus ?? null
@@ -172,5 +206,5 @@ app.post("/pronounce", async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`[pronounce-backend] listening on :${PORT}`);
+  console.log(`[pronounce-backend] listening on :${PORT} (${DEPLOY_MARKER})`);
 });
