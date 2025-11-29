@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json({ limit: "15mb" }));
 
 // Marker damit du sofort siehst, ob Koyeb wirklich den neuen Code fährt:
-const DEPLOY_MARKER = "DEPLOY_2025-11-29_v3";
+const DEPLOY_MARKER = "DEPLOY_2025-11-29_v4";
 
 const {
   PORT = "8000",
