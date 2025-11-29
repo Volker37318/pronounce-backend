@@ -1,9 +1,8 @@
 import express from "express";
 
 const app = express();
-app.use(express.json({ limit: "15mb" }));
 
-const DEPLOY_MARKER = "DEPLOY_2025-11-29_v5";
+const DEPLOY_MARKER = "DEPLOY_2025-11-29_v6";
 
 const {
   PORT = "8000",
@@ -23,36 +22,48 @@ function isAllowedOrigin(origin) {
 }
 
 /**
- * CORS: Header IMMER setzen (auch bei 401/403/500),
- * Preflight OPTIONS IMMER mit 204 beantworten.
- * => Browser blockiert nicht mehr und du siehst echte JSON-Fehler.
+ * CORS ganz am Anfang (VOR JSON parser!), damit auch 413/400 Fehler CORS-Header haben.
  */
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
-  // immer setzen:
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-pronounce-secret");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  // Wichtig: Für Debug/Robustheit geben wir origin zurück, wenn vorhanden.
-  // (Sicherheit kommt bei dir ohnehin über PRONOUNCE_SECRET.)
-  if (origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  }
+  // damit du Fehler IMMER lesen kannst (auch wenn Origin nicht whitelisted)
+  if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+  else res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Preflight:
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // Optional: wenn du Origin wirklich strikt blocken willst, dann 403 (aber mit CORS-Header!)
   if (origin && !isAllowedOrigin(origin)) {
     return res.status(403).json({ ok: false, error: "CORS blocked", origin, allowedOrigins });
   }
 
   next();
+});
+
+// Jetzt erst JSON parser (größer, weil Base64)
+app.use(express.json({ limit: "30mb" }));
+
+// Parser-Fehler sauber als JSON zurückgeben (mit CORS-Headern, weil oben schon gesetzt!)
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  const msg = String(err?.message || err);
+
+  // typisch bei zu groß: "entity too large"
+  const isTooLarge =
+    err?.type === "entity.too.large" ||
+    /too large|entity too large|request entity too large/i.test(msg);
+
+  return res.status(isTooLarge ? 413 : 400).json({
+    ok: false,
+    error: isTooLarge ? "Payload too large (audio too long)" : "Bad JSON / body parse error",
+    details: msg,
+    marker: DEPLOY_MARKER
+  });
 });
 
 app.get("/health", (_req, res) => {
@@ -108,9 +119,9 @@ function extractBest(json) {
 
 app.post("/pronounce", async (req, res) => {
   try {
-    // Secret check
     const serverSecret = String(PRONOUNCE_SECRET || "").trim();
     const secret = String(req.headers["x-pronounce-secret"] || "").trim();
+
     if (!serverSecret || secret !== serverSecret) {
       return res.status(401).json({ ok: false, error: "Unauthorized (bad secret)" });
     }
@@ -133,7 +144,6 @@ app.post("/pronounce", async (req, res) => {
     const mimeFromDataUrl = detectMime(audioBase64);
     const mime = (audioMime || mimeFromDataUrl || "").toLowerCase();
 
-    // Ganz wichtig: Azure REST mag WebM oft nicht -> sauberer Fehlertext
     if (mime.includes("webm")) {
       return res.status(400).json({
         ok: false,
