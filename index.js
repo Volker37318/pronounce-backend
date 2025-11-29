@@ -3,7 +3,7 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "15mb" }));
 
-const DEPLOY_MARKER = "DEPLOY_2025-11-29_v4";
+const DEPLOY_MARKER = "DEPLOY_2025-11-29_v5";
 
 const {
   PORT = "8000",
@@ -16,33 +16,40 @@ const {
 const allowedOrigins = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
 const azureRegion = (AZURE_SPEECH_REGION || "").trim().toLowerCase();
 
-// --- Robust CORS (setzt Header IMMER; beantwortet OPTIONS sauber) ---
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // server-to-server/curl
+  if (!origin) return true;
   if (allowedOrigins.length === 0) return true;
   return allowedOrigins.includes(origin);
 }
 
+/**
+ * CORS: Header IMMER setzen (auch bei 401/403/500),
+ * Preflight OPTIONS IMMER mit 204 beantworten.
+ * => Browser blockiert nicht mehr und du siehst echte JSON-Fehler.
+ */
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
+  // immer setzen:
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-pronounce-secret");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  if (origin && isAllowedOrigin(origin)) {
+  // Wichtig: Für Debug/Robustheit geben wir origin zurück, wenn vorhanden.
+  // (Sicherheit kommt bei dir ohnehin über PRONOUNCE_SECRET.)
+  if (origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
   }
 
-  // Preflight immer direkt beantworten (ohne Secret-Check!)
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
+  // Preflight:
+  if (req.method === "OPTIONS") return res.status(204).end();
 
-  // Wenn Browser-Origin da ist, aber nicht erlaubt: klare Antwort
+  // Optional: wenn du Origin wirklich strikt blocken willst, dann 403 (aber mit CORS-Header!)
   if (origin && !isAllowedOrigin(origin)) {
-    return res.status(403).json({ ok: false, error: "CORS blocked", origin });
+    return res.status(403).json({ ok: false, error: "CORS blocked", origin, allowedOrigins });
   }
 
   next();
@@ -101,9 +108,9 @@ function extractBest(json) {
 
 app.post("/pronounce", async (req, res) => {
   try {
+    // Secret check
     const serverSecret = String(PRONOUNCE_SECRET || "").trim();
     const secret = String(req.headers["x-pronounce-secret"] || "").trim();
-
     if (!serverSecret || secret !== serverSecret) {
       return res.status(401).json({ ok: false, error: "Unauthorized (bad secret)" });
     }
@@ -126,8 +133,7 @@ app.post("/pronounce", async (req, res) => {
     const mimeFromDataUrl = detectMime(audioBase64);
     const mime = (audioMime || mimeFromDataUrl || "").toLowerCase();
 
-    // Azure REST (Short audio) ist zuverlässig mit WAV/PCM oder OGG/OPUS.
-    // WebM ist sehr häufig die Ursache für “Azure request failed”.
+    // Ganz wichtig: Azure REST mag WebM oft nicht -> sauberer Fehlertext
     if (mime.includes("webm")) {
       return res.status(400).json({
         ok: false,
