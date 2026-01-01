@@ -299,6 +299,26 @@ app.post("/pronounce", async (req, res) => {
   }
 });
 
-app.listen(Number(PORT), () => {
-  console.log(`[pronounce-backend] listening on :${PORT} (${DEPLOY_MARKER})`);
-});
+const PORT_NUM = Number(process.env.PORT || PORT || 8000);
+const MAX_RETRIES = 30;
+const RETRY_DELAY_MS = 500;
+
+function listenWithRetry(attempt = 1) {
+  const server = app.listen(PORT_NUM, () => {
+    console.log(`[pronounce-backend] listening on :${PORT_NUM} (${DEPLOY_MARKER})`);
+  });
+
+  server.on("error", (err) => {
+    if (err && err.code === "EADDRINUSE" && attempt < MAX_RETRIES) {
+      console.warn(`[pronounce-backend] Port ${PORT_NUM} busy (EADDRINUSE). Retry ${attempt}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
+      try { server.close(); } catch {}
+      setTimeout(() => listenWithRetry(attempt + 1), RETRY_DELAY_MS);
+      return;
+    }
+    console.error("[pronounce-backend] Fatal listen error:", err);
+    process.exit(1);
+  });
+}
+
+listenWithRetry();
+
