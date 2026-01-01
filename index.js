@@ -302,8 +302,3 @@ app.post("/pronounce", async (req, res) => {
 app.listen(Number(PORT), () => {
   console.log(`[pronounce-backend] listening on :${PORT} (${DEPLOY_MARKER})`);
 });
-
-
-app.listen(Number(PORT), () => {
-  console.log(`[pronounce-backend] listening on :${PORT} (${DEPLOY_MARKER})`);
-});
