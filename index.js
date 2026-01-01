@@ -2,7 +2,7 @@ import express from "express";
 
 const app = express();
 
-const DEPLOY_MARKER = "DEPLOY_2026-01-01_v8_TEXTPLAIN_NO_PREFLIGHT";
+const DEPLOY_MARKER = "DEPLOY_2026-01-01_v9_TEXTPLAIN_CORS_CLEAN";
 
 const {
   PORT = "8000",
@@ -12,17 +12,22 @@ const {
   ALLOWED_ORIGINS = ""
 } = process.env;
 
-const allowedOrigins = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
-const azureRegion = (AZURE_SPEECH_REGION || "").trim().toLowerCase();
+const allowedOrigins = String(ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const azureRegion = String(AZURE_SPEECH_REGION || "").trim().toLowerCase();
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true;
-  if (allowedOrigins.length === 0) return true;
+  if (!origin) return true;                 // No Origin header => allow (server-to-server etc.)
+  if (allowedOrigins.length === 0) return true; // If not configured => allow all
   return allowedOrigins.includes(origin);
 }
 
 /**
- * CORS ganz am Anfang (VOR Parser!), damit auch Fehler CORS-Header haben.
+ * ✅ CORS ganz am Anfang (VOR Parser!), damit auch Fehler CORS-Header haben.
+ * ✅ Access-Control-Allow-Origin wird NUR gesetzt, wenn origin erlaubt ist (sauber).
  */
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -32,20 +37,27 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-pronounce-secret");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  // Header immer setzen (damit Browser nie "No Access-Control-Allow-Origin" sieht)
-  if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
-  else res.setHeader("Access-Control-Allow-Origin", "*");
-
-  if (req.method === "OPTIONS") return res.status(204).end();
-
-  if (origin && !isAllowedOrigin(origin)) {
-    return res.status(403).json({ ok: false, error: "CORS blocked", origin, allowedOrigins, marker: DEPLOY_MARKER });
+  if (!origin) {
+    // z.B. direkte Browser-Navigation zu /health oder Server-to-server
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (isAllowedOrigin(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    // Keine Allow-Origin Header setzen!
+    return res.status(403).json({
+      ok: false,
+      error: "CORS blocked",
+      origin,
+      allowedOrigins,
+      marker: DEPLOY_MARKER
+    });
   }
 
+  if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
 
-// ✅ Wichtig: zuerst text/plain erlauben (vermeidet Preflight-Probleme)
+// ✅ Wichtig: zuerst text/plain erlauben (vermeidet Preflight-Probleme im Frontend)
 app.use(express.text({ type: "text/plain", limit: "30mb" }));
 
 // Dann JSON parser (falls doch application/json kommt)
@@ -248,7 +260,10 @@ app.post("/pronounce", async (req, res) => {
 
     const accuracyScore = Number(pa?.AccuracyScore);
     const pronScore = Number(pa?.PronScore);
-    const overallScore = Math.round(Number.isFinite(pronScore) ? pronScore : (Number.isFinite(accuracyScore) ? accuracyScore : 0));
+    const overallScore = Math.round(
+      Number.isFinite(pronScore) ? pronScore :
+      (Number.isFinite(accuracyScore) ? accuracyScore : 0)
+    );
 
     // ✅ Basis-Matrix: bestanden wenn Accuracy >= 80
     const PASS_THRESHOLD = 80;
@@ -295,10 +310,15 @@ app.post("/pronounce", async (req, res) => {
       }
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: String(err?.message || err), marker: DEPLOY_MARKER });
+    return res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+      marker: DEPLOY_MARKER
+    });
   }
 });
 
+// ✅ Koyeb Rolling Deploy Fix: Retry bei EADDRINUSE
 const PORT_NUM = Number(process.env.PORT || PORT || 8000);
 const MAX_RETRIES = 30;
 const RETRY_DELAY_MS = 500;
@@ -321,4 +341,5 @@ function listenWithRetry(attempt = 1) {
 }
 
 listenWithRetry();
+
 
