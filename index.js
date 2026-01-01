@@ -2,7 +2,7 @@ import express from "express";
 
 const app = express();
 
-const DEPLOY_MARKER = "DEPLOY_2025-11-29_v6";
+const DEPLOY_MARKER = "DEPLOY_2026-01-01_v7_ICHACH_GATE";
 
 const {
   PORT = "8000",
@@ -53,7 +53,6 @@ app.use((err, req, res, next) => {
   if (!err) return next();
   const msg = String(err?.message || err);
 
-  // typisch bei zu groß: "entity too large"
   const isTooLarge =
     err?.type === "entity.too.large" ||
     /too large|entity too large|request entity too large/i.test(msg);
@@ -98,7 +97,7 @@ function buildPronHeader({ referenceText, enableMiscue = true }) {
   const payload = {
     ReferenceText: referenceText,
     GradingSystem: "HundredMark",
-    Granularity: "Phoneme",
+    Granularity: "Phoneme",            // ✅ wichtig für Ich/Ach
     Dimension: "Comprehensive",
     EnableMiscue: enableMiscue ? "True" : "False"
   };
@@ -117,12 +116,47 @@ function extractBest(json) {
   return nbest[0] || null;
 }
 
+/* -------------------------
+   Ich/Ach Gate – Helper
+-------------------------- */
+
+// Ermittelt grob, ob im Wort ein „ich-Laut“ erwartet ist.
+// (nach vorderen Vokalen / Diphthongen + "ch", aber nicht "sch")
+function isIchLautWord(targetText) {
+  const w = String(targetText || "").trim().toLowerCase();
+  if (!w.includes("ch")) return false;
+  if (w.includes("sch")) return false;
+  return /(?:i|ie|ei|e|ä|ö|ü|eu|äu)ch/.test(w);
+}
+
+// Versucht, aus Azure-Phonem-Liste den Score für "ç" (oder "C") zu finden.
+// Wir nehmen den MIN-Score, damit ein schlechtes "ch" sicher durchschlägt.
+function extractIchLautScore(best) {
+  const words = Array.isArray(best?.Words) ? best.Words : [];
+  let minScore = null;
+
+  for (const w of words) {
+    const phs = Array.isArray(w?.Phonemes) ? w.Phonemes : [];
+    for (const p of phs) {
+      const ph = String(p?.Phoneme || "");
+      const s = Number(p?.PronunciationAssessment?.AccuracyScore);
+      if (!Number.isFinite(s)) continue;
+
+      if (/ç|C/.test(ph)) {
+        minScore = (minScore === null) ? s : Math.min(minScore, s);
+      }
+    }
+  }
+  return minScore; // null wenn nicht gefunden
+}
+
 app.post("/pronounce", async (req, res) => {
   try {
     const serverSecret = String(PRONOUNCE_SECRET || "").trim();
     const secret = String(req.headers["x-pronounce-secret"] || "").trim();
 
-    if (!serverSecret || secret !== serverSecret) {
+    // ✅ Secret nur prüfen, wenn serverseitig gesetzt
+    if (serverSecret && secret !== serverSecret) {
       return res.status(401).json({ ok: false, error: "Unauthorized (bad secret)" });
     }
 
@@ -144,6 +178,7 @@ app.post("/pronounce", async (req, res) => {
     const mimeFromDataUrl = detectMime(audioBase64);
     const mime = (audioMime || mimeFromDataUrl || "").toLowerCase();
 
+    // ✅ Wir bleiben hart: webm nicht unterstützt (Frontend soll OGG aufnehmen)
     if (mime.includes("webm")) {
       return res.status(400).json({
         ok: false,
@@ -168,7 +203,7 @@ app.post("/pronounce", async (req, res) => {
       `&format=detailed`;
 
     const pronHeader = buildPronHeader({
-      referenceText: targetText,
+      referenceText: String(targetText).trim(),
       enableMiscue: enableMiscue !== false
     });
 
@@ -198,19 +233,47 @@ app.post("/pronounce", async (req, res) => {
 
     const best = extractBest(json);
     const pa = best?.PronunciationAssessment || {};
-    const overallScore = Math.round(Number(pa?.PronScore ?? pa?.AccuracyScore ?? 0));
+
+    const accuracyScore = Number(pa?.AccuracyScore);
+    const pronScore = Number(pa?.PronScore);
+    const overallScore = Math.round(Number.isFinite(pronScore) ? pronScore : (Number.isFinite(accuracyScore) ? accuracyScore : 0));
+
+    // ✅ Basis-Matrix (wie bei dir): bestanden wenn Accuracy >= 80
+    const PASS_THRESHOLD = 80;
+    let passed = Number.isFinite(accuracyScore) ? (accuracyScore >= PASS_THRESHOLD) : (overallScore >= PASS_THRESHOLD);
+
+    // ✅ Ich/Ach Gate
+    const ichLautExpected = isIchLautWord(targetText);
+    const ICH_PHONEME_MIN = 70;
+
+    let ichLautScore = null;
+    let ichLautError = false;
+
+    if (ichLautExpected) {
+      ichLautScore = extractIchLautScore(best);
+      if (Number.isFinite(ichLautScore) && ichLautScore < ICH_PHONEME_MIN) {
+        ichLautError = true;
+        passed = false;
+      }
+    }
 
     return res.json({
       ok: true,
+      passed,
       overallScore,
       grade: pickGrade(overallScore),
+      flags: {
+        ichLautExpected,
+        ichLautError,
+        ichLautScore
+      },
       details: {
         targetText,
         language,
         recognizedText: best?.Lexical || best?.Display || json?.DisplayText || "",
         scores: {
-          pronScore: pa?.PronScore ?? null,
-          accuracyScore: pa?.AccuracyScore ?? null,
+          pronScore: Number.isFinite(pronScore) ? pronScore : null,
+          accuracyScore: Number.isFinite(accuracyScore) ? accuracyScore : null,
           fluencyScore: pa?.FluencyScore ?? null,
           completenessScore: pa?.CompletenessScore ?? null,
           prosodyScore: pa?.ProsodyScore ?? null
