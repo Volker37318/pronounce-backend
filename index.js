@@ -2,7 +2,7 @@ import express from "express";
 
 const app = express();
 
-const DEPLOY_MARKER = "DEPLOY_2026-01-01_v7_ICHACH_GATE";
+const DEPLOY_MARKER = "DEPLOY_2026-01-01_v8_TEXTPLAIN_NO_PREFLIGHT";
 
 const {
   PORT = "8000",
@@ -22,7 +22,7 @@ function isAllowedOrigin(origin) {
 }
 
 /**
- * CORS ganz am Anfang (VOR JSON parser!), damit auch 413/400 Fehler CORS-Header haben.
+ * CORS ganz am Anfang (VOR Parser!), damit auch Fehler CORS-Header haben.
  */
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -32,23 +32,26 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-pronounce-secret");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  // damit du Fehler IMMER lesen kannst (auch wenn Origin nicht whitelisted)
+  // Header immer setzen (damit Browser nie "No Access-Control-Allow-Origin" sieht)
   if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
   else res.setHeader("Access-Control-Allow-Origin", "*");
 
   if (req.method === "OPTIONS") return res.status(204).end();
 
   if (origin && !isAllowedOrigin(origin)) {
-    return res.status(403).json({ ok: false, error: "CORS blocked", origin, allowedOrigins });
+    return res.status(403).json({ ok: false, error: "CORS blocked", origin, allowedOrigins, marker: DEPLOY_MARKER });
   }
 
   next();
 });
 
-// Jetzt erst JSON parser (größer, weil Base64)
+// ✅ Wichtig: zuerst text/plain erlauben (vermeidet Preflight-Probleme)
+app.use(express.text({ type: "text/plain", limit: "30mb" }));
+
+// Dann JSON parser (falls doch application/json kommt)
 app.use(express.json({ limit: "30mb" }));
 
-// Parser-Fehler sauber als JSON zurückgeben (mit CORS-Headern, weil oben schon gesetzt!)
+// Parser-Fehler sauber als JSON zurückgeben (CORS-Header sind schon gesetzt)
 app.use((err, req, res, next) => {
   if (!err) return next();
   const msg = String(err?.message || err);
@@ -152,38 +155,46 @@ function extractIchLautScore(best) {
 
 app.post("/pronounce", async (req, res) => {
   try {
+    // ✅ text/plain (ohne Preflight) -> JSON selbst parsen
+    if (typeof req.body === "string") {
+      try { req.body = JSON.parse(req.body); } catch {}
+    }
+
     const serverSecret = String(PRONOUNCE_SECRET || "").trim();
     const secret = String(req.headers["x-pronounce-secret"] || "").trim();
 
     // ✅ Secret nur prüfen, wenn serverseitig gesetzt
     if (serverSecret && secret !== serverSecret) {
-      return res.status(401).json({ ok: false, error: "Unauthorized (bad secret)" });
+      return res.status(401).json({ ok: false, error: "Unauthorized (bad secret)", marker: DEPLOY_MARKER });
     }
 
     const { targetText, language, audioBase64, enableMiscue, audioMime } = req.body || {};
     if (!targetText || !language || !audioBase64) {
       return res.status(400).json({
         ok: false,
-        error: "Missing fields. Required: targetText, language, audioBase64"
+        error: "Missing fields. Required: targetText, language, audioBase64",
+        marker: DEPLOY_MARKER
       });
     }
 
     if (!AZURE_SPEECH_KEY || !azureRegion) {
       return res.status(500).json({
         ok: false,
-        error: "Missing env. Required: AZURE_SPEECH_KEY, AZURE_SPEECH_REGION"
+        error: "Missing env. Required: AZURE_SPEECH_KEY, AZURE_SPEECH_REGION",
+        marker: DEPLOY_MARKER
       });
     }
 
     const mimeFromDataUrl = detectMime(audioBase64);
     const mime = (audioMime || mimeFromDataUrl || "").toLowerCase();
 
-    // ✅ Wir bleiben hart: webm nicht unterstützt (Frontend soll OGG aufnehmen)
+    // ✅ Wir akzeptieren WAV/PCM (Frontend sendet WAV)
     if (mime.includes("webm")) {
       return res.status(400).json({
         ok: false,
-        error: "Unsupported audio container: audio/webm. Record as audio/ogg;codecs=opus or WAV/PCM.",
-        mime
+        error: "Unsupported audio container: audio/webm. Send WAV/PCM (16k mono) or OGG/Opus.",
+        mime,
+        marker: DEPLOY_MARKER
       });
     }
 
@@ -193,7 +204,7 @@ app.post("/pronounce", async (req, res) => {
 
     const audioBuf = base64ToBuffer(audioBase64);
     if (!audioBuf || audioBuf.length < 2000) {
-      return res.status(400).json({ ok: false, error: "Audio too short/empty" });
+      return res.status(400).json({ ok: false, error: "Audio too short/empty", marker: DEPLOY_MARKER });
     }
 
     const endpoint =
@@ -227,7 +238,8 @@ app.post("/pronounce", async (req, res) => {
         ok: false,
         error: "Azure request failed",
         azureStatus: azureResp.status,
-        azureBody: json
+        azureBody: json,
+        marker: DEPLOY_MARKER
       });
     }
 
@@ -238,7 +250,7 @@ app.post("/pronounce", async (req, res) => {
     const pronScore = Number(pa?.PronScore);
     const overallScore = Math.round(Number.isFinite(pronScore) ? pronScore : (Number.isFinite(accuracyScore) ? accuracyScore : 0));
 
-    // ✅ Basis-Matrix (wie bei dir): bestanden wenn Accuracy >= 80
+    // ✅ Basis-Matrix: bestanden wenn Accuracy >= 80
     const PASS_THRESHOLD = 80;
     let passed = Number.isFinite(accuracyScore) ? (accuracyScore >= PASS_THRESHOLD) : (overallScore >= PASS_THRESHOLD);
 
@@ -283,9 +295,14 @@ app.post("/pronounce", async (req, res) => {
       }
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err), marker: DEPLOY_MARKER });
   }
 });
+
+app.listen(Number(PORT), () => {
+  console.log(`[pronounce-backend] listening on :${PORT} (${DEPLOY_MARKER})`);
+});
+
 
 app.listen(Number(PORT), () => {
   console.log(`[pronounce-backend] listening on :${PORT} (${DEPLOY_MARKER})`);
