@@ -1,12 +1,12 @@
 import express from "express";
+import multer from "multer";
 
 const app = express();
 
 /**
- * Version/Marker: ändere den Marker ruhig bei jedem Deploy,
- * damit du in /health sofort siehst, was live ist.
+ * Marker hochsetzen, damit du in /health sofort siehst, dass es live ist.
  */
-const DEPLOY_MARKER = "DEPLOY_2026-01-03_v11_CORS_OK_SINGLE_LISTEN";
+const DEPLOY_MARKER = "DEPLOY_2026-01-03_v13_FORMDATA_PRIMARY_FALLBACK_BASE64";
 
 const {
   PORT = "8000",
@@ -19,8 +19,8 @@ const {
 /** Normalisiert Origins: trim, Quotes entfernen, trailing slash entfernen */
 function normOrigin(s) {
   let x = String(s || "").trim();
-  x = x.replace(/^["']+|["']+$/g, ""); // remove surrounding quotes
-  x = x.replace(/\/+$/g, "");          // remove trailing slash
+  x = x.replace(/^["']+|["']+$/g, "");
+  x = x.replace(/\/+$/g, "");
   return x;
 }
 
@@ -33,14 +33,13 @@ const azureRegion = String(AZURE_SPEECH_REGION || "").trim().toLowerCase();
 
 function isAllowedOrigin(origin) {
   const o = normOrigin(origin);
-  if (!o) return true;                    // no Origin header => allow
-  if (allowedOrigins.length === 0) return true; // if not configured => allow all
+  if (!o) return true;
+  if (allowedOrigins.length === 0) return true;
   return allowedOrigins.includes(o);
 }
 
 /**
- * ✅ CORS MUSS ganz am Anfang stehen, damit auch Fehlerantworten CORS-Header haben.
- * ✅ Bei erlaubter Origin spiegeln wir die Origin zurück.
+ * ✅ CORS ganz am Anfang
  */
 app.use((req, res, next) => {
   const originRaw = req.headers.origin;
@@ -52,13 +51,10 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Max-Age", "86400");
 
   if (!origin) {
-    // z.B. direkte Navigation / server-to-server
     res.setHeader("Access-Control-Allow-Origin", "*");
   } else if (isAllowedOrigin(origin)) {
-    // IMPORTANT: reflect origin (not "*") for browsers
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
-    // keine Allow-Origin Header setzen!
     return res.status(403).send("CORS blocked");
   }
 
@@ -66,12 +62,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// ✅ Erst text/plain erlauben (reduziert Preflight/komplizierte Clients)
+// ✅ Nur text/plain + json parsen (multipart wird von multer verarbeitet)
 app.use(express.text({ type: "text/plain", limit: "30mb" }));
-// ✅ Dann JSON parser (falls doch application/json kommt)
 app.use(express.json({ limit: "30mb" }));
 
-// Parser-Fehler sauber als JSON zurückgeben (CORS-Header sind schon gesetzt)
+// Parser-Fehler sauber als JSON zurückgeben
 app.use((err, req, res, next) => {
   if (!err) return next();
   const msg = String(err?.message || err);
@@ -106,6 +101,30 @@ app.get("/health", (_req, res) => {
   });
 });
 
+/* -------------------------
+   Multipart/FormData (wie seite3.js Prinzip)
+-------------------------- */
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB
+});
+
+function isMultipart(req) {
+  const ct = String(req.headers["content-type"] || "").toLowerCase();
+  return ct.startsWith("multipart/form-data");
+}
+
+// Multer nur anwenden, wenn wirklich multipart
+function maybeUpload(req, res, next) {
+  if (!isMultipart(req)) return next();
+  return upload.single("audio")(req, res, next);
+}
+
+/* -------------------------
+   Helpers
+-------------------------- */
+
 function base64ToBuffer(audioBase64) {
   if (typeof audioBase64 !== "string" || audioBase64.length < 10) {
     throw new Error("audioBase64 missing or invalid");
@@ -114,7 +133,7 @@ function base64ToBuffer(audioBase64) {
   return Buffer.from(cleaned, "base64");
 }
 
-function detectMime(audioBase64) {
+function detectMimeFromDataUrl(audioBase64) {
   const m = /^data:([^;]+);base64,/.exec(audioBase64 || "");
   if (!m) return null;
   return (m[1] || "").toLowerCase();
@@ -173,19 +192,171 @@ function extractIchLautScore(best) {
   return minScore;
 }
 
-app.post("/pronounce", async (req, res) => {
-  try {
-    // ✅ text/plain -> JSON selbst parsen
-    if (typeof req.body === "string") {
-      try { req.body = JSON.parse(req.body); } catch {}
-    }
+async function callAzurePronunciation({ audioBuf, audioMime, targetText, language, enableMiscue = true }) {
+  if (!AZURE_SPEECH_KEY || !azureRegion) {
+    return {
+      ok: false,
+      status: 500,
+      body: { ok: false, error: "Missing env. Required: AZURE_SPEECH_KEY, AZURE_SPEECH_REGION", marker: DEPLOY_MARKER },
+    };
+  }
 
+  const mime = String(audioMime || "").toLowerCase();
+
+  // webm ist bei Azure Pronunciation i.d.R. problematisch -> hier bewusst blocken
+  if (mime.includes("webm")) {
+    return {
+      ok: false,
+      status: 400,
+      body: { ok: false, error: "Unsupported audio container: audio/webm. Send WAV/PCM (16k mono) or OGG/Opus.", mime, marker: DEPLOY_MARKER },
+    };
+  }
+
+  const contentType = mime.includes("ogg")
+    ? "audio/ogg; codecs=opus"
+    : "audio/wav; codecs=audio/pcm; samplerate=16000";
+
+  const endpoint =
+    `https://${azureRegion}.stt.speech.microsoft.com` +
+    `/speech/recognition/conversation/cognitiveservices/v1` +
+    `?language=${encodeURIComponent(language)}` +
+    `&format=detailed`;
+
+  const pronHeader = buildPronHeader({
+    referenceText: String(targetText).trim(),
+    enableMiscue: enableMiscue !== false,
+  });
+
+  const azureResp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": contentType,
+      "Ocp-Apim-Subscription-Key": String(AZURE_SPEECH_KEY).trim(),
+      "Pronunciation-Assessment": pronHeader,
+    },
+    body: audioBuf,
+  });
+
+  const raw = await azureResp.text();
+  let json;
+  try { json = JSON.parse(raw); } catch { json = { raw }; }
+
+  if (!azureResp.ok) {
+    return {
+      ok: false,
+      status: 502,
+      body: { ok: false, error: "Azure request failed", azureStatus: azureResp.status, azureBody: json, marker: DEPLOY_MARKER },
+    };
+  }
+
+  return { ok: true, status: 200, body: json };
+}
+
+/* -------------------------
+   /pronounce
+   Primär: FormData (audio file) wie seite3.js Prinzip
+   Fallback: JSON/text mit audioBase64
+-------------------------- */
+
+app.post("/pronounce", maybeUpload, async (req, res) => {
+  try {
+    // ✅ Secret nur prüfen, wenn serverseitig gesetzt
     const serverSecret = String(PRONOUNCE_SECRET || "").trim();
     const secret = String(req.headers["x-pronounce-secret"] || "").trim();
-
-    // ✅ Secret nur prüfen, wenn serverseitig gesetzt
     if (serverSecret && secret !== serverSecret) {
       return res.status(401).json({ ok: false, error: "Unauthorized (bad secret)", marker: DEPLOY_MARKER });
+    }
+
+    // -------------------------
+    // A) multipart/form-data
+    // -------------------------
+    if (isMultipart(req)) {
+      const targetText = String(req.body?.targetText || "").trim();
+      const language = String(req.body?.language || "").trim();
+      const audioMime = String(req.body?.audioMime || req.file?.mimetype || "audio/wav").toLowerCase();
+
+      if (!targetText || !language || !req.file?.buffer) {
+        return res.status(400).json({
+          ok: false,
+          error: "Missing fields. Required: targetText, language, audio(file)",
+          marker: DEPLOY_MARKER,
+        });
+      }
+
+      const audioBuf = req.file.buffer;
+      if (!audioBuf || audioBuf.length < 2000) {
+        return res.status(400).json({ ok: false, error: "Audio too short/empty", marker: DEPLOY_MARKER });
+      }
+
+      const azure = await callAzurePronunciation({
+        audioBuf,
+        audioMime,
+        targetText,
+        language,
+        enableMiscue: true,
+      });
+
+      if (!azure.ok) return res.status(azure.status).json(azure.body);
+
+      const json = azure.body;
+      const best = extractBest(json);
+      const pa = best?.PronunciationAssessment || {};
+
+      const accuracyScore = Number(pa?.AccuracyScore);
+      const pronScore = Number(pa?.PronScore);
+      const overallScore = Math.round(
+        Number.isFinite(pronScore) ? pronScore :
+        (Number.isFinite(accuracyScore) ? accuracyScore : 0)
+      );
+
+      const PASS_THRESHOLD = 80;
+      let passed = Number.isFinite(accuracyScore)
+        ? (accuracyScore >= PASS_THRESHOLD)
+        : (overallScore >= PASS_THRESHOLD);
+
+      const ichLautExpected = isIchLautWord(targetText);
+      const ICH_PHONEME_MIN = 70;
+
+      let ichLautScore = null;
+      let ichLautError = false;
+
+      if (ichLautExpected) {
+        ichLautScore = extractIchLautScore(best);
+        if (Number.isFinite(ichLautScore) && ichLautScore < ICH_PHONEME_MIN) {
+          ichLautError = true;
+          passed = false;
+        }
+      }
+
+      return res.json({
+        ok: true,
+        passed,
+        overallScore,
+        grade: pickGrade(overallScore),
+        flags: { ichLautExpected, ichLautError, ichLautScore },
+        details: {
+          targetText,
+          language,
+          recognizedText: best?.Lexical || best?.Display || json?.DisplayText || "",
+          scores: {
+            pronScore: Number.isFinite(pronScore) ? pronScore : null,
+            accuracyScore: Number.isFinite(accuracyScore) ? accuracyScore : null,
+            fluencyScore: pa?.FluencyScore ?? null,
+            completenessScore: pa?.CompletenessScore ?? null,
+            prosodyScore: pa?.ProsodyScore ?? null,
+          },
+          words: Array.isArray(best?.Words) ? best.Words : [],
+          recognitionStatus: json?.RecognitionStatus ?? null,
+        },
+      });
+    }
+
+    // -------------------------
+    // B) Fallback: JSON/text audioBase64
+    // -------------------------
+    if (typeof req.body === "string") {
+      try { req.body = JSON.parse(req.body); } catch {}
     }
 
     const { targetText, language, audioBase64, enableMiscue, audioMime } = req.body || {};
@@ -197,71 +368,25 @@ app.post("/pronounce", async (req, res) => {
       });
     }
 
-    if (!AZURE_SPEECH_KEY || !azureRegion) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing env. Required: AZURE_SPEECH_KEY, AZURE_SPEECH_REGION",
-        marker: DEPLOY_MARKER,
-      });
-    }
-
-    const mimeFromDataUrl = detectMime(audioBase64);
+    const mimeFromDataUrl = detectMimeFromDataUrl(audioBase64);
     const mime = (audioMime || mimeFromDataUrl || "").toLowerCase();
-
-    if (mime.includes("webm")) {
-      return res.status(400).json({
-        ok: false,
-        error: "Unsupported audio container: audio/webm. Send WAV/PCM (16k mono) or OGG/Opus.",
-        mime,
-        marker: DEPLOY_MARKER,
-      });
-    }
-
-    const contentType = mime.includes("ogg")
-      ? "audio/ogg; codecs=opus"
-      : "audio/wav; codecs=audio/pcm; samplerate=16000";
 
     const audioBuf = base64ToBuffer(audioBase64);
     if (!audioBuf || audioBuf.length < 2000) {
       return res.status(400).json({ ok: false, error: "Audio too short/empty", marker: DEPLOY_MARKER });
     }
 
-    const endpoint =
-      `https://${azureRegion}.stt.speech.microsoft.com` +
-      `/speech/recognition/conversation/cognitiveservices/v1` +
-      `?language=${encodeURIComponent(language)}` +
-      `&format=detailed`;
-
-    const pronHeader = buildPronHeader({
-      referenceText: String(targetText).trim(),
-      enableMiscue: enableMiscue !== false,
+    const azure = await callAzurePronunciation({
+      audioBuf,
+      audioMime: mime,
+      targetText,
+      language,
+      enableMiscue,
     });
 
-    const azureResp = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": contentType,
-        "Ocp-Apim-Subscription-Key": String(AZURE_SPEECH_KEY).trim(),
-        "Pronunciation-Assessment": pronHeader,
-      },
-      body: audioBuf,
-    });
+    if (!azure.ok) return res.status(azure.status).json(azure.body);
 
-    const raw = await azureResp.text();
-    let json;
-    try { json = JSON.parse(raw); } catch { json = { raw }; }
-
-    if (!azureResp.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: "Azure request failed",
-        azureStatus: azureResp.status,
-        azureBody: json,
-        marker: DEPLOY_MARKER,
-      });
-    }
-
+    const json = azure.body;
     const best = extractBest(json);
     const pa = best?.PronunciationAssessment || {};
 
@@ -322,11 +447,9 @@ app.post("/pronounce", async (req, res) => {
 });
 
 /**
- * ✅ IMPORTANT: Nur EIN Listen-Start. Kein Retry, kein Doppelstart.
- * Koyeb managed Deploy/Rolling/Restart selbst.
+ * ✅ NUR EIN Listen-Start
  */
 const PORT_NUM = Number(process.env.PORT || PORT || 8000);
-
 app.listen(PORT_NUM, "0.0.0.0", () => {
   console.log(`[pronounce-backend] listening on :${PORT_NUM} (${DEPLOY_MARKER})`);
 });
