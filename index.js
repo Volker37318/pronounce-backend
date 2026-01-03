@@ -2,7 +2,7 @@ import express from "express";
 
 const app = express();
 
-const DEPLOY_MARKER = "DEPLOY_2026-01-01_v9_TEXTPLAIN_CORS_CLEAN";
+const DEPLOY_MARKER = "DEPLOY_2026-01-03_v10_CORS_ORIGIN_NORMALIZE";
 
 const {
   PORT = "8000",
@@ -12,25 +12,37 @@ const {
   ALLOWED_ORIGINS = ""
 } = process.env;
 
+/** Normalisiert Origins, damit ALLOWED_ORIGINS auch mit "..." oder / am Ende klappt */
+function normOrigin(s) {
+  let x = String(s || "").trim();
+  // remove surrounding quotes
+  x = x.replace(/^["']+|["']+$/g, "");
+  // remove trailing slash
+  x = x.replace(/\/+$/g, "");
+  return x;
+}
+
 const allowedOrigins = String(ALLOWED_ORIGINS || "")
   .split(",")
-  .map(s => s.trim())
+  .map(normOrigin)
   .filter(Boolean);
 
 const azureRegion = String(AZURE_SPEECH_REGION || "").trim().toLowerCase();
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true;                 // No Origin header => allow (server-to-server etc.)
-  if (allowedOrigins.length === 0) return true; // If not configured => allow all
-  return allowedOrigins.includes(origin);
+  const o = normOrigin(origin);
+  if (!o) return true;                    // no Origin header => allow
+  if (allowedOrigins.length === 0) return true; // if not configured => allow all
+  return allowedOrigins.includes(o);
 }
 
 /**
  * ✅ CORS ganz am Anfang (VOR Parser!), damit auch Fehler CORS-Header haben.
- * ✅ Access-Control-Allow-Origin wird NUR gesetzt, wenn origin erlaubt ist (sauber).
+ * ✅ Access-Control-Allow-Origin wird gesetzt, wenn origin erlaubt ist.
  */
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
+  const originRaw = req.headers.origin;
+  const origin = normOrigin(originRaw);
 
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -38,12 +50,13 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Max-Age", "86400");
 
   if (!origin) {
-    // z.B. direkte Browser-Navigation zu /health oder Server-to-server
+    // z.B. direkte Navigation / server-to-server
     res.setHeader("Access-Control-Allow-Origin", "*");
   } else if (isAllowedOrigin(origin)) {
+    // IMPORTANT: reflect origin (not "*") for browsers
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
-    // Keine Allow-Origin Header setzen!
+    // keine Allow-Origin Header setzen!
     return res.status(403).json({
       ok: false,
       error: "CORS blocked",
@@ -59,7 +72,6 @@ app.use((req, res, next) => {
 
 // ✅ Wichtig: zuerst text/plain erlauben (vermeidet Preflight-Probleme im Frontend)
 app.use(express.text({ type: "text/plain", limit: "30mb" }));
-
 // Dann JSON parser (falls doch application/json kommt)
 app.use(express.json({ limit: "30mb" }));
 
@@ -78,6 +90,10 @@ app.use((err, req, res, next) => {
     details: msg,
     marker: DEPLOY_MARKER
   });
+});
+
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("pronounce-backend ok");
 });
 
 app.get("/health", (_req, res) => {
@@ -112,7 +128,7 @@ function buildPronHeader({ referenceText, enableMiscue = true }) {
   const payload = {
     ReferenceText: referenceText,
     GradingSystem: "HundredMark",
-    Granularity: "Phoneme",            // ✅ wichtig für Ich/Ach
+    Granularity: "Phoneme", // ✅ wichtig für Ich/Ach
     Dimension: "Comprehensive",
     EnableMiscue: enableMiscue ? "True" : "False"
   };
@@ -135,8 +151,6 @@ function extractBest(json) {
    Ich/Ach Gate – Helper
 -------------------------- */
 
-// Ermittelt grob, ob im Wort ein „ich-Laut“ erwartet ist.
-// (nach vorderen Vokalen / Diphthongen + "ch", aber nicht "sch")
 function isIchLautWord(targetText) {
   const w = String(targetText || "").trim().toLowerCase();
   if (!w.includes("ch")) return false;
@@ -144,8 +158,6 @@ function isIchLautWord(targetText) {
   return /(?:i|ie|ei|e|ä|ö|ü|eu|äu)ch/.test(w);
 }
 
-// Versucht, aus Azure-Phonem-Liste den Score für "ç" (oder "C") zu finden.
-// Wir nehmen den MIN-Score, damit ein schlechtes "ch" sicher durchschlägt.
 function extractIchLautScore(best) {
   const words = Array.isArray(best?.Words) ? best.Words : [];
   let minScore = null;
@@ -162,7 +174,7 @@ function extractIchLautScore(best) {
       }
     }
   }
-  return minScore; // null wenn nicht gefunden
+  return minScore;
 }
 
 app.post("/pronounce", async (req, res) => {
@@ -200,7 +212,6 @@ app.post("/pronounce", async (req, res) => {
     const mimeFromDataUrl = detectMime(audioBase64);
     const mime = (audioMime || mimeFromDataUrl || "").toLowerCase();
 
-    // ✅ Wir akzeptieren WAV/PCM (Frontend sendet WAV)
     if (mime.includes("webm")) {
       return res.status(400).json({
         ok: false,
@@ -265,11 +276,9 @@ app.post("/pronounce", async (req, res) => {
       (Number.isFinite(accuracyScore) ? accuracyScore : 0)
     );
 
-    // ✅ Basis-Matrix: bestanden wenn Accuracy >= 80
     const PASS_THRESHOLD = 80;
     let passed = Number.isFinite(accuracyScore) ? (accuracyScore >= PASS_THRESHOLD) : (overallScore >= PASS_THRESHOLD);
 
-    // ✅ Ich/Ach Gate
     const ichLautExpected = isIchLautWord(targetText);
     const ICH_PHONEME_MIN = 70;
 
@@ -289,11 +298,7 @@ app.post("/pronounce", async (req, res) => {
       passed,
       overallScore,
       grade: pickGrade(overallScore),
-      flags: {
-        ichLautExpected,
-        ichLautError,
-        ichLautScore
-      },
+      flags: { ichLautExpected, ichLautError, ichLautScore },
       details: {
         targetText,
         language,
@@ -339,6 +344,8 @@ function listenWithRetry(attempt = 1) {
     process.exit(1);
   });
 }
+
+listenWithRetry();
 
 listenWithRetry();
 
