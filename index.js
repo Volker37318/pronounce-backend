@@ -2,23 +2,25 @@ import express from "express";
 
 const app = express();
 
-const DEPLOY_MARKER = "DEPLOY_2026-01-03_v10_CORS_ORIGIN_NORMALIZE";
+/**
+ * Version/Marker: ändere den Marker ruhig bei jedem Deploy,
+ * damit du in /health sofort siehst, was live ist.
+ */
+const DEPLOY_MARKER = "DEPLOY_2026-01-03_v11_CORS_OK_SINGLE_LISTEN";
 
 const {
   PORT = "8000",
   AZURE_SPEECH_KEY,
   AZURE_SPEECH_REGION,
   PRONOUNCE_SECRET,
-  ALLOWED_ORIGINS = ""
+  ALLOWED_ORIGINS = "",
 } = process.env;
 
-/** Normalisiert Origins, damit ALLOWED_ORIGINS auch mit "..." oder / am Ende klappt */
+/** Normalisiert Origins: trim, Quotes entfernen, trailing slash entfernen */
 function normOrigin(s) {
   let x = String(s || "").trim();
-  // remove surrounding quotes
-  x = x.replace(/^["']+|["']+$/g, "");
-  // remove trailing slash
-  x = x.replace(/\/+$/g, "");
+  x = x.replace(/^["']+|["']+$/g, ""); // remove surrounding quotes
+  x = x.replace(/\/+$/g, "");          // remove trailing slash
   return x;
 }
 
@@ -37,8 +39,8 @@ function isAllowedOrigin(origin) {
 }
 
 /**
- * ✅ CORS ganz am Anfang (VOR Parser!), damit auch Fehler CORS-Header haben.
- * ✅ Access-Control-Allow-Origin wird gesetzt, wenn origin erlaubt ist.
+ * ✅ CORS MUSS ganz am Anfang stehen, damit auch Fehlerantworten CORS-Header haben.
+ * ✅ Bei erlaubter Origin spiegeln wir die Origin zurück.
  */
 app.use((req, res, next) => {
   const originRaw = req.headers.origin;
@@ -57,22 +59,16 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
     // keine Allow-Origin Header setzen!
-    return res.status(403).json({
-      ok: false,
-      error: "CORS blocked",
-      origin,
-      allowedOrigins,
-      marker: DEPLOY_MARKER
-    });
+    return res.status(403).send("CORS blocked");
   }
 
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
 
-// ✅ Wichtig: zuerst text/plain erlauben (vermeidet Preflight-Probleme im Frontend)
+// ✅ Erst text/plain erlauben (reduziert Preflight/komplizierte Clients)
 app.use(express.text({ type: "text/plain", limit: "30mb" }));
-// Dann JSON parser (falls doch application/json kommt)
+// ✅ Dann JSON parser (falls doch application/json kommt)
 app.use(express.json({ limit: "30mb" }));
 
 // Parser-Fehler sauber als JSON zurückgeben (CORS-Header sind schon gesetzt)
@@ -88,7 +84,7 @@ app.use((err, req, res, next) => {
     ok: false,
     error: isTooLarge ? "Payload too large (audio too long)" : "Bad JSON / body parse error",
     details: msg,
-    marker: DEPLOY_MARKER
+    marker: DEPLOY_MARKER,
   });
 });
 
@@ -105,8 +101,8 @@ app.get("/health", (_req, res) => {
       hasPRONOUNCE_SECRET: !!String(PRONOUNCE_SECRET || "").trim(),
       hasAZURE_SPEECH_KEY: !!String(AZURE_SPEECH_KEY || "").trim(),
       azureRegion: azureRegion || "(missing)",
-      allowedOrigins
-    }
+      allowedOrigins,
+    },
   });
 });
 
@@ -128,9 +124,9 @@ function buildPronHeader({ referenceText, enableMiscue = true }) {
   const payload = {
     ReferenceText: referenceText,
     GradingSystem: "HundredMark",
-    Granularity: "Phoneme", // ✅ wichtig für Ich/Ach
+    Granularity: "Phoneme",
     Dimension: "Comprehensive",
-    EnableMiscue: enableMiscue ? "True" : "False"
+    EnableMiscue: enableMiscue ? "True" : "False",
   };
   return Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
 }
@@ -179,7 +175,7 @@ function extractIchLautScore(best) {
 
 app.post("/pronounce", async (req, res) => {
   try {
-    // ✅ text/plain (ohne Preflight) -> JSON selbst parsen
+    // ✅ text/plain -> JSON selbst parsen
     if (typeof req.body === "string") {
       try { req.body = JSON.parse(req.body); } catch {}
     }
@@ -197,7 +193,7 @@ app.post("/pronounce", async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "Missing fields. Required: targetText, language, audioBase64",
-        marker: DEPLOY_MARKER
+        marker: DEPLOY_MARKER,
       });
     }
 
@@ -205,7 +201,7 @@ app.post("/pronounce", async (req, res) => {
       return res.status(500).json({
         ok: false,
         error: "Missing env. Required: AZURE_SPEECH_KEY, AZURE_SPEECH_REGION",
-        marker: DEPLOY_MARKER
+        marker: DEPLOY_MARKER,
       });
     }
 
@@ -217,7 +213,7 @@ app.post("/pronounce", async (req, res) => {
         ok: false,
         error: "Unsupported audio container: audio/webm. Send WAV/PCM (16k mono) or OGG/Opus.",
         mime,
-        marker: DEPLOY_MARKER
+        marker: DEPLOY_MARKER,
       });
     }
 
@@ -238,7 +234,7 @@ app.post("/pronounce", async (req, res) => {
 
     const pronHeader = buildPronHeader({
       referenceText: String(targetText).trim(),
-      enableMiscue: enableMiscue !== false
+      enableMiscue: enableMiscue !== false,
     });
 
     const azureResp = await fetch(endpoint, {
@@ -247,9 +243,9 @@ app.post("/pronounce", async (req, res) => {
         Accept: "application/json",
         "Content-Type": contentType,
         "Ocp-Apim-Subscription-Key": String(AZURE_SPEECH_KEY).trim(),
-        "Pronunciation-Assessment": pronHeader
+        "Pronunciation-Assessment": pronHeader,
       },
-      body: audioBuf
+      body: audioBuf,
     });
 
     const raw = await azureResp.text();
@@ -262,7 +258,7 @@ app.post("/pronounce", async (req, res) => {
         error: "Azure request failed",
         azureStatus: azureResp.status,
         azureBody: json,
-        marker: DEPLOY_MARKER
+        marker: DEPLOY_MARKER,
       });
     }
 
@@ -277,7 +273,9 @@ app.post("/pronounce", async (req, res) => {
     );
 
     const PASS_THRESHOLD = 80;
-    let passed = Number.isFinite(accuracyScore) ? (accuracyScore >= PASS_THRESHOLD) : (overallScore >= PASS_THRESHOLD);
+    let passed = Number.isFinite(accuracyScore)
+      ? (accuracyScore >= PASS_THRESHOLD)
+      : (overallScore >= PASS_THRESHOLD);
 
     const ichLautExpected = isIchLautWord(targetText);
     const ICH_PHONEME_MIN = 70;
@@ -308,43 +306,28 @@ app.post("/pronounce", async (req, res) => {
           accuracyScore: Number.isFinite(accuracyScore) ? accuracyScore : null,
           fluencyScore: pa?.FluencyScore ?? null,
           completenessScore: pa?.CompletenessScore ?? null,
-          prosodyScore: pa?.ProsodyScore ?? null
+          prosodyScore: pa?.ProsodyScore ?? null,
         },
         words: Array.isArray(best?.Words) ? best.Words : [],
-        recognitionStatus: json?.RecognitionStatus ?? null
-      }
+        recognitionStatus: json?.RecognitionStatus ?? null,
+      },
     });
   } catch (err) {
     return res.status(500).json({
       ok: false,
       error: String(err?.message || err),
-      marker: DEPLOY_MARKER
+      marker: DEPLOY_MARKER,
     });
   }
 });
 
-// ✅ Koyeb Rolling Deploy Fix: Retry bei EADDRINUSE
+/**
+ * ✅ IMPORTANT: Nur EIN Listen-Start. Kein Retry, kein Doppelstart.
+ * Koyeb managed Deploy/Rolling/Restart selbst.
+ */
 const PORT_NUM = Number(process.env.PORT || PORT || 8000);
-const MAX_RETRIES = 30;
-const RETRY_DELAY_MS = 500;
 
-function listenWithRetry(attempt = 1) {
-  const server = app.listen(PORT_NUM, () => {
-    console.log(`[pronounce-backend] listening on :${PORT_NUM} (${DEPLOY_MARKER})`);
-  });
-
-  server.on("error", (err) => {
-    if (err && err.code === "EADDRINUSE" && attempt < MAX_RETRIES) {
-      console.warn(`[pronounce-backend] Port ${PORT_NUM} busy (EADDRINUSE). Retry ${attempt}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
-      try { server.close(); } catch {}
-      setTimeout(() => listenWithRetry(attempt + 1), RETRY_DELAY_MS);
-      return;
-    }
-    console.error("[pronounce-backend] Fatal listen error:", err);
-    process.exit(1);
-  });
-}
-
-listenWithRetry();
-
+app.listen(PORT_NUM, "0.0.0.0", () => {
+  console.log(`[pronounce-backend] listening on :${PORT_NUM} (${DEPLOY_MARKER})`);
+});
 
