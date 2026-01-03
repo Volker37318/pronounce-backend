@@ -347,6 +347,4 @@ function listenWithRetry(attempt = 1) {
 
 listenWithRetry();
 
-listenWithRetry();
-
 
