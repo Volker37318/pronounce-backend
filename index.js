@@ -6,7 +6,7 @@ const app = express();
 /**
  * Marker hochsetzen, damit du in /health sofort siehst, dass es live ist.
  */
-const DEPLOY_MARKER = "DEPLOY_2026-01-03_v13_FORMDATA_PRIMARY_FALLBACK_BASE64";
+const DEPLOY_MARKER = "DEPLOY_2026-01-04_v14_CORS_HEADERS_NO_STORE";
 
 const {
   PORT = "8000",
@@ -33,8 +33,8 @@ const azureRegion = String(AZURE_SPEECH_REGION || "").trim().toLowerCase();
 
 function isAllowedOrigin(origin) {
   const o = normOrigin(origin);
-  if (!o) return true;
-  if (allowedOrigins.length === 0) return true;
+  if (!o) return true;               // server-to-server / curl
+  if (allowedOrigins.length === 0) return true; // wenn leer: offen
   return allowedOrigins.includes(o);
 }
 
@@ -47,7 +47,8 @@ app.use((req, res, next) => {
 
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-pronounce-secret");
+  // ✅ Allow-Headers erweitert (hilft bei Preflight in manchen Setups)
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-pronounce-secret, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 
   if (!origin) {
@@ -84,10 +85,12 @@ app.use((err, req, res, next) => {
 });
 
 app.get("/", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   res.type("text/plain").send("pronounce-backend ok");
 });
 
 app.get("/health", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   res.json({
     ok: true,
     service: "pronounce-backend",
@@ -261,6 +264,9 @@ async function callAzurePronunciation({ audioBuf, audioMime, targetText, languag
 
 app.post("/pronounce", maybeUpload, async (req, res) => {
   try {
+    // kurze Debug-Logs (hilft enorm bei Fehleranalyse)
+    // console.log(`[${DEPLOY_MARKER}] ${req.method} ${req.path} ct=${req.headers["content-type"] || ""}`);
+
     // ✅ Secret nur prüfen, wenn serverseitig gesetzt
     const serverSecret = String(PRONOUNCE_SECRET || "").trim();
     const secret = String(req.headers["x-pronounce-secret"] || "").trim();
@@ -453,4 +459,5 @@ const PORT_NUM = Number(process.env.PORT || PORT || 8000);
 app.listen(PORT_NUM, "0.0.0.0", () => {
   console.log(`[pronounce-backend] listening on :${PORT_NUM} (${DEPLOY_MARKER})`);
 });
+
 
