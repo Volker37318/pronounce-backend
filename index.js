@@ -3,15 +3,17 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 8000);
 
 // Einfacher Shared Secret als Kopierschutz
 const PRONOUNCE_SECRET = process.env.PRONOUNCE_SECRET || "CHANGE_ME";
 
-app.use(cors({
-  origin: "*", // später: auf deine Netlify-Domain einschränken
-  methods: ["POST", "OPTIONS"]
-}));
+app.use(
+  cors({
+    origin: "*", // später: auf deine Netlify-Domain einschränken
+    methods: ["POST", "OPTIONS"],
+  })
+);
 app.use(express.json({ limit: "5mb" }));
 
 // Health-Check
@@ -47,8 +49,8 @@ app.post("/pronounce", async (req, res) => {
       grade,
       details: {
         targetText,
-        language
-      }
+        language,
+      },
     });
   } catch (err) {
     console.error(err);
@@ -56,6 +58,6 @@ app.post("/pronounce", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Pronounce backend listening on port ${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v14_MARKER)`);
 });
