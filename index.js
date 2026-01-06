@@ -216,3 +216,7 @@ app.post("/pronounce", upload.single("audio"), async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v16_AZURE_STRICT_MATCH)`);
 });
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v16_AZURE_STRICT_MATCH)`);
+});
