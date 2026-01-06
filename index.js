@@ -1,66 +1,38 @@
-// index.js – Pronunciation Backend (multipart/form-data) für Koyeb
-// FIX: echte Aussprachebewertung über Azure + "STRICT word match"
-// Ergebnis: Wenn targetText="Danke" und gesprochen wird "essen" -> strictOk=false -> overallScore=0
+// index.js – Pronounce Backend (STRICT word match via Whisper transcription)
+// Ziel: Wenn targetText="Danke" und gesprochen wird "essen" -> strictOk=false -> overallScore=0
+// Notes:
+// - Works with browser MediaRecorder formats (webm/ogg/mp4) because Whisper can transcribe them.
+// - This is "strict word match" (exactness). If you later want phoneme-based pronunciation scoring,
+//   you need Azure Pronunciation Assessment + audio conversion to PCM WAV.
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import sdk from "microsoft-cognitiveservices-speech-sdk";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8000);
 
-// Security
+// ---- Security ----
 const PRONOUNCE_SECRET = process.env.PRONOUNCE_SECRET || "CHANGE_ME";
 
-// Azure Speech
-const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY || "";
-const AZURE_SPEECH_REGION = process.env.AZURE_SPEECH_REGION || "";
-
-// CORS allowlist (Komma-separiert). Wenn leer -> "*" (wie bisher)
+// ---- CORS allowlist (comma-separated). If empty => allow all (like before) ----
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").trim();
 
-// Upload: in-memory
+// ---- Whisper Proxy (your Koyeb service) ----
+// Example: https://dramatic-roseline-contentconnect-academy-7daf9931.koyeb.app/whisper
+const WHISPER_PROXY_URL = (process.env.WHISPER_PROXY_URL || "").trim();
+// Optional secret if your whisper proxy expects one (leave empty if not used)
+const WHISPER_PROXY_SECRET = (process.env.WHISPER_PROXY_SECRET || "").trim();
+
+// ---- Upload: in-memory ----
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (!ALLOWED_ORIGINS) return cb(null, true);
-      const allowed = ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
-      if (allowed.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked"));
-    },
-    methods: ["POST", "OPTIONS", "GET"],
-    allowedHeaders: ["Content-Type", "x-pronounce-secret"],
-    credentials: false,
-  })
-);
-
-// IMPORTANT: Preflight must always succeed
-app.options("*", (req, res) => res.sendStatus(204));
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "pronounce-backend",
-    env: {
-      hasAZURE_SPEECH_KEY: !!AZURE_SPEECH_KEY,
-      azureRegion: AZURE_SPEECH_REGION || null,
-      hasPRONOUNCE_SECRET: !!PRONOUNCE_SECRET && PRONOUNCE_SECRET !== "CHANGE_ME",
-      allowedOrigins: ALLOWED_ORIGINS ? ALLOWED_ORIGINS.split(",").map(s=>s.trim()).filter(Boolean) : ["*"],
-    },
-  });
-});
-
 // ---------- helpers ----------
 function norm(s) {
-  // normalize for strict compare (single word)
-  // keep letters/numbers/spaces (unicode), remove punctuation
+  // Normalize for strict compare: lowercase, unicode normalize, remove punctuation, collapse spaces
   return String(s || "")
     .toLowerCase()
     .normalize("NFKC")
@@ -77,89 +49,94 @@ function gradeFrom(score) {
   return "poor";
 }
 
-function extractAzureJsonResult(result) {
-  try {
-    const j = result?.properties?.getProperty(sdk.PropertyId.SpeechServiceResponse_JsonResult);
-    return j || "";
-  } catch {
-    return "";
-  }
+function parseAllowedOrigins() {
+  if (!ALLOWED_ORIGINS) return null;
+  return ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
 }
 
-function getAccuracyFromAzureJson(jsonStr) {
-  try {
-    const j = JSON.parse(jsonStr || "{}");
-    const acc = j?.NBest?.[0]?.PronunciationAssessment?.AccuracyScore;
-    return Number.isFinite(+acc) ? +acc : 0;
-  } catch {
-    return 0;
+// ---------- CORS (must also succeed for preflight) ----------
+app.use(cors({
+  origin: (origin, cb) => {
+    // origin can be undefined for same-origin or some tools
+    if (!origin) return cb(null, true);
+    const allowed = parseAllowedOrigins();
+    if (!allowed) return cb(null, true);
+    if (allowed.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  methods: ["POST", "OPTIONS", "GET"],
+  allowedHeaders: ["Content-Type", "x-pronounce-secret", "x-whisper-secret"],
+  credentials: false,
+}));
+
+// Always answer OPTIONS (preflight) with 204
+app.options("*", (req, res) => res.sendStatus(204));
+
+// ---------- Health ----------
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "pronounce-backend",
+    mode: "whisper_strict_match",
+    env: {
+      hasPRONOUNCE_SECRET: !!PRONOUNCE_SECRET && PRONOUNCE_SECRET !== "CHANGE_ME",
+      allowedOrigins: parseAllowedOrigins() || ["*"],
+      hasWHISPER_PROXY_URL: !!WHISPER_PROXY_URL,
+      whisperProxyHost: WHISPER_PROXY_URL ? (() => {
+        try { return new URL(WHISPER_PROXY_URL).host; } catch { return null; }
+      })() : null,
+      hasWHISPER_PROXY_SECRET: !!WHISPER_PROXY_SECRET,
+    }
+  });
+});
+
+// ---------- Whisper transcription ----------
+async function transcribeWithWhisperProxy({ audioBuffer, mimetype }) {
+  if (!WHISPER_PROXY_URL) {
+    throw new Error("Missing WHISPER_PROXY_URL env var");
   }
-}
 
-function getWordsFromAzureJson(jsonStr) {
-  try {
-    const j = JSON.parse(jsonStr || "{}");
-    return j?.NBest?.[0]?.Words || [];
-  } catch {
-    return [];
-  }
-}
+  // Node 18+ has fetch/FormData/Blob available (undici)
+  const fd = new FormData();
+  // Whisper proxies commonly expect: field name "audio"
+  const blob = new Blob([audioBuffer], { type: mimetype || "application/octet-stream" });
+  fd.append("audio", blob, "speech." + (guessExt(mimetype) || "bin"));
 
-async function assessWithAzure({ audioBuffer, targetText, language }) {
-  if (!AZURE_SPEECH_KEY || !AZURE_SPEECH_REGION) {
-    throw new Error("Azure Speech env missing (AZURE_SPEECH_KEY / AZURE_SPEECH_REGION)");
-  }
+  const headers = {};
+  if (WHISPER_PROXY_SECRET) headers["x-whisper-secret"] = WHISPER_PROXY_SECRET;
 
-  const refText = String(targetText || "").trim();
-  const speechConfig = sdk.SpeechConfig.fromSubscription(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION);
-  speechConfig.speechRecognitionLanguage = String(language || "de-DE");
-
-  // PushStream from buffer
-  const pushStream = sdk.AudioInputStream.createPushStream();
-  pushStream.write(audioBuffer);
-  pushStream.close();
-
-  const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
-  const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
-
-  // Pronunciation Assessment config
-  const paConfig = new sdk.PronunciationAssessmentConfig(
-    refText,
-    sdk.PronunciationAssessmentGradingSystem.HundredMark,
-    sdk.PronunciationAssessmentGranularity.Phoneme,
-    true
-  );
-  paConfig.applyTo(recognizer);
-
-  const result = await new Promise((resolve, reject) => {
-    recognizer.recognizeOnceAsync(resolve, reject);
+  const res = await fetch(WHISPER_PROXY_URL, {
+    method: "POST",
+    headers,
+    body: fd,
   });
 
-  const recognizedText = (result?.text || "").toString();
+  const txt = await res.text();
+  if (!res.ok) {
+    throw new Error(`Whisper proxy HTTP ${res.status}: ${txt}`);
+  }
 
-  const azureJson = extractAzureJsonResult(result);
-  const accuracyScore = getAccuracyFromAzureJson(azureJson);
-  const words = getWordsFromAzureJson(azureJson);
-
-  // STRICT: must match the target word
-  const strictOk = norm(recognizedText) === norm(refText);
-  const overallScore = strictOk ? Math.round(accuracyScore) : 0;
-
-  return {
-    recognizedText,
-    referenceText: refText,
-    strictOk,
-    accuracyScore: Math.round(accuracyScore),
-    overallScore,
-    words,
-    rawAzureJson: azureJson,
-  };
+  // Try JSON first, then fallback to plain text
+  try {
+    const j = JSON.parse(txt);
+    // common shapes: {text:"..."} or {ok:true,text:"..."} or {transcript:"..."}
+    return String(j.text || j.transcript || j.result || "").trim();
+  } catch {
+    return String(txt || "").trim();
+  }
 }
 
-// Erwartet FormData:
-// - targetText (string)
-// - language (string)
-// - audio (file)  -> Feldname MUSS "audio" heißen
+function guessExt(m) {
+  const s = String(m || "").toLowerCase();
+  if (s.includes("webm")) return "webm";
+  if (s.includes("ogg")) return "ogg";
+  if (s.includes("wav")) return "wav";
+  if (s.includes("mpeg") || s.includes("mp3")) return "mp3";
+  if (s.includes("mp4") || s.includes("aac")) return "m4a";
+  return "";
+}
+
+// ---------- Route: /pronounce ----------
 app.post("/pronounce", upload.single("audio"), async (req, res) => {
   try {
     const clientSecret = req.headers["x-pronounce-secret"];
@@ -168,7 +145,7 @@ app.post("/pronounce", upload.single("audio"), async (req, res) => {
     }
 
     const targetText = (req.body?.targetText || "").toString().trim();
-    const language = (req.body?.language || "").toString().trim();
+    const language = (req.body?.language || "").toString().trim(); // kept for compatibility
     const file = req.file;
 
     if (!targetText || !language || !file) {
@@ -180,20 +157,28 @@ app.post("/pronounce", upload.single("audio"), async (req, res) => {
       });
     }
 
-    const audioBuffer = file.buffer;
+    const recognizedText = await transcribeWithWhisperProxy({
+      audioBuffer: file.buffer,
+      mimetype: file.mimetype,
+    });
 
-    const result = await assessWithAzure({ audioBuffer, targetText, language });
+    // STRICT: must match the target word
+    const strictOk = norm(recognizedText) === norm(targetText);
+
+    // Score logic:
+    // - exact word => 100
+    // - else => 0
+    const overallScore = strictOk ? 100 : 0;
 
     return res.json({
       ok: true,
-      mode: "multipart",
-      grade: gradeFrom(result.overallScore),
-      overallScore: result.overallScore,
+      mode: "whisper_strict_match",
+      grade: gradeFrom(overallScore),
+      overallScore,
 
-      strictOk: result.strictOk,
-      recognizedText: result.recognizedText,
-      referenceText: result.referenceText,
-      accuracyScore: result.accuracyScore,
+      strictOk,
+      recognizedText,
+      referenceText: targetText,
 
       file: {
         originalname: file.originalname,
@@ -202,10 +187,6 @@ app.post("/pronounce", upload.single("audio"), async (req, res) => {
       },
 
       details: { targetText, language },
-
-      // optional debug
-      words: result.words,
-      rawAzureJson: result.rawAzureJson,
     });
   } catch (err) {
     console.error("[pronounce-backend] /pronounce error:", err);
@@ -214,9 +195,5 @@ app.post("/pronounce", upload.single("audio"), async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v16_AZURE_STRICT_MATCH)`);
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v16_AZURE_STRICT_MATCH)`);
+  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v16_WHISPER_STRICT_MATCH)`);
 });
