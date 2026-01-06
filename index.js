@@ -1,5 +1,8 @@
 // index.js – Pronunciation Backend (multipart/form-data) für Koyeb
 // STRICT via Whisper-Transkript: Wenn targetText="Danke" und gesprochen wird "essen" -> strictOk=false -> overallScore=0
+//
+// FIX v17.1: Whisper-Proxies erwarten teils multipart-Feldname "file" statt "audio".
+// -> Wir versuchen zuerst "audio", und bei "MulterError: Unexpected field" automatisch "file".
 
 import express from "express";
 import cors from "cors";
@@ -69,40 +72,57 @@ function norm(s) {
     .trim();
 }
 
-// Whisper call (multipart)
+// Whisper call (multipart) – robust: try different field names
 async function transcribeWithWhisper({ audioBuffer, filename, mimetype, language }) {
-  const fd = new FormData();
+  async function tryField(fieldName) {
+    const fd = new FormData();
+    const blob = new Blob([audioBuffer], { type: mimetype || "application/octet-stream" });
 
-  // Viele Whisper-Proxies erwarten "audio". Manche "file".
-  // Wir senden "audio" (wie dein Frontend) – das ist am wahrscheinlichsten.
-  const blob = new Blob([audioBuffer], { type: mimetype || "application/octet-stream" });
-  fd.append("audio", blob, filename || "speech.webm");
+    // Viele Proxies erwarten: fieldName="file" ODER "audio"
+    fd.append(fieldName, blob, filename || "speech.webm");
 
-  // Optional: Sprache (wenn dein Proxy es nutzt)
-  if (language) fd.append("language", String(language));
+    // Optional: Sprache (wenn dein Proxy es nutzt)
+    if (language) fd.append("language", String(language));
 
-  const r = await fetch(WHISPER_URL, { method: "POST", body: fd });
-  const txt = await r.text();
+    const r = await fetch(WHISPER_URL, { method: "POST", body: fd });
+    const txt = await r.text();
 
-  let j = null;
-  try { j = JSON.parse(txt); } catch { j = null; }
+    let j = null;
+    try { j = JSON.parse(txt); } catch { j = null; }
 
-  if (!r.ok) {
-    throw new Error(`Whisper HTTP ${r.status}: ${txt}`);
+    if (!r.ok) {
+      const err = new Error(`Whisper HTTP ${r.status}: ${txt}`);
+      err._raw = txt;
+      err._status = r.status;
+      throw err;
+    }
+
+    // Proxy-Formate: {text:"..."} oder {transcript:"..."} oder {result:"..."} oder plain string
+    const transcript =
+      (j && (j.text || j.transcript || j.result)) ? String(j.text || j.transcript || j.result)
+      : (typeof txt === "string" ? txt : "");
+
+    return transcript.trim();
   }
 
-  // Proxy-Formate: {text:"..."} oder {transcript:"..."} oder plain string
-  const transcript =
-    (j && (j.text || j.transcript || j.result)) ? String(j.text || j.transcript || j.result)
-    : (typeof txt === "string" ? txt : "");
-
-  return transcript.trim();
+  // 1) first try "audio" (dein Frontend sendet "audio")
+  try {
+    return await tryField("audio");
+  } catch (e) {
+    const raw = String(e?._raw || e?.message || "");
+    // 2) if Multer "Unexpected field", try "file"
+    if (raw.includes("MulterError: Unexpected field")) {
+      return await tryField("file");
+    }
+    // 3) otherwise rethrow
+    throw e;
+  }
 }
 
 // Erwartet FormData:
 // - targetText (string)
 // - language (string)
-// - audio (file)  -> Feldname MUSS "audio" heißen
+// - audio (file)  -> Feldname MUSS "audio" heißen (Frontend)
 app.post("/pronounce", upload.single("audio"), async (req, res) => {
   try {
     const clientSecret = req.headers["x-pronounce-secret"];
@@ -132,7 +152,7 @@ app.post("/pronounce", upload.single("audio"), async (req, res) => {
 
     const strictOk = norm(recognizedText) === norm(targetText);
 
-    // Score: strikt. (Du willst: falsches Wort => 0)
+    // Score: strikt. (Falsches Wort => 0)
     const overallScore = strictOk ? 100 : 0;
 
     return res.json({
@@ -160,5 +180,5 @@ app.post("/pronounce", upload.single("audio"), async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v17_WHISPER_STRICT_MATCH)`);
+  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v17_1_WHISPER_STRICT_MATCH_FIELD_FIX)`);
 });
