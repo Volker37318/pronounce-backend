@@ -1,9 +1,5 @@
-// index.js – Pronounce Backend (STRICT word match via Whisper transcription)
-// Ziel: Wenn targetText="Danke" und gesprochen wird "essen" -> strictOk=false -> overallScore=0
-// Notes:
-// - Works with browser MediaRecorder formats (webm/ogg/mp4) because Whisper can transcribe them.
-// - This is "strict word match" (exactness). If you later want phoneme-based pronunciation scoring,
-//   you need Azure Pronunciation Assessment + audio conversion to PCM WAV.
+// index.js — pronounce-backend STRICT v16 (Whisper transcript → exact word match)
+// Node >= 18 (ESM). Buildpack friendly.
 
 import express from "express";
 import cors from "cors";
@@ -13,139 +9,114 @@ const app = express();
 const PORT = Number(process.env.PORT || 8000);
 
 // ---- Security ----
-const PRONOUNCE_SECRET = process.env.PRONOUNCE_SECRET || "CHANGE_ME";
+const PRONOUNCE_SECRET = (process.env.PRONOUNCE_SECRET || "CHANGE_ME").trim();
 
-// ---- CORS allowlist (comma-separated). If empty => allow all (like before) ----
+// ---- CORS allowlist (comma-separated). If empty => allow all. ----
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").trim();
 
-// ---- Whisper Proxy (your Koyeb service) ----
-// Example: https://dramatic-roseline-contentconnect-academy-7daf9931.koyeb.app/whisper
+// ---- Whisper proxy (required) ----
+// Must be FULL route, e.g. https://<service>.koyeb.app/whisper
 const WHISPER_PROXY_URL = (process.env.WHISPER_PROXY_URL || "").trim();
-// Optional secret if your whisper proxy expects one (leave empty if not used)
-const WHISPER_PROXY_SECRET = (process.env.WHISPER_PROXY_SECRET || "").trim();
 
-// ---- Upload: in-memory ----
+// ---- Upload ----
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-// ---------- helpers ----------
-function norm(s) {
-  // Normalize for strict compare: lowercase, unicode normalize, remove punctuation, collapse spaces
-  return String(s || "")
+// ---- Helpers ----
+function allowedOrigin(origin) {
+  if (!origin) return true;                 // server-to-server, curl, same-origin etc.
+  if (!ALLOWED_ORIGINS) return true;        // allow all
+  const allowed = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+  return allowed.includes(origin);
+}
+
+function normWord(s) {
+  // Strict-ish: lower, trim, collapse spaces, strip punctuation.
+  // German specific: keep umlauts; also normalize ß <-> ss by mapping to same form.
+  const t = String(s || "")
     .toLowerCase()
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .trim()
+    .replace(/[“”„"']/g, "")
+    .replace(/[\.,;:!?()\[\]{}<>]/g, " ")
     .replace(/\s+/g, " ")
-    .trim();
+    .replace(/ß/g, "ss");
+  return t;
 }
 
-function gradeFrom(score) {
-  const s = Number(score) || 0;
-  if (s >= 85) return "excellent";
-  if (s >= 75) return "good";
-  if (s >= 65) return "needs_practice";
-  return "poor";
+function transcriptToTokens(text) {
+  const t = normWord(text);
+  if (!t) return [];
+  return t.split(" ").filter(Boolean);
 }
 
-function parseAllowedOrigins() {
-  if (!ALLOWED_ORIGINS) return null;
-  return ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+function exactWordMatch(targetWord, transcriptText) {
+  const target = normWord(targetWord);
+  const tokens = transcriptToTokens(transcriptText);
+
+  // Exact match if ANY token equals target OR transcript equals target exactly
+  if (!target) return { ok: false, reason: "empty-target", transcript: transcriptText || "" };
+  if (!transcriptText) return { ok: false, reason: "empty-transcript", transcript: "" };
+
+  const full = normWord(transcriptText);
+  const hit = (full === target) || tokens.includes(target);
+
+  return { ok: hit, transcript: transcriptText, tokens };
 }
 
-// ---------- CORS (must also succeed for preflight) ----------
-app.use(cors({
-  origin: (origin, cb) => {
-    // origin can be undefined for same-origin or some tools
-    if (!origin) return cb(null, true);
-    const allowed = parseAllowedOrigins();
-    if (!allowed) return cb(null, true);
-    if (allowed.includes(origin)) return cb(null, true);
-    return cb(null, false);
-  },
-  methods: ["POST", "OPTIONS", "GET"],
-  allowedHeaders: ["Content-Type", "x-pronounce-secret", "x-whisper-secret"],
-  credentials: false,
-}));
+// ---- CORS ----
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (allowedOrigin(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked"));
+    },
+    methods: ["POST", "OPTIONS", "GET"],
+    allowedHeaders: ["Content-Type", "x-pronounce-secret"],
+    credentials: false,
+  })
+);
 
-// Always answer OPTIONS (preflight) with 204
-app.options("*", (req, res) => res.sendStatus(204));
+// IMPORTANT: explicit OPTIONS handler (preflight)
+app.options("*", (req, res) => {
+  // If cors() rejected earlier, Express won't reach here. For allowed origins, return 204.
+  res.sendStatus(204);
+});
 
-// ---------- Health ----------
+// ---- Health ----
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "pronounce-backend",
-    mode: "whisper_strict_match",
+    marker: "DEPLOY_v16_WHISPER_STRICT",
     env: {
       hasPRONOUNCE_SECRET: !!PRONOUNCE_SECRET && PRONOUNCE_SECRET !== "CHANGE_ME",
-      allowedOrigins: parseAllowedOrigins() || ["*"],
       hasWHISPER_PROXY_URL: !!WHISPER_PROXY_URL,
-      whisperProxyHost: WHISPER_PROXY_URL ? (() => {
-        try { return new URL(WHISPER_PROXY_URL).host; } catch { return null; }
-      })() : null,
-      hasWHISPER_PROXY_SECRET: !!WHISPER_PROXY_SECRET,
+      allowedOrigins: ALLOWED_ORIGINS ? ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) : ["*"],
     }
   });
 });
 
-// ---------- Whisper transcription ----------
-async function transcribeWithWhisperProxy({ audioBuffer, mimetype }) {
-  if (!WHISPER_PROXY_URL) {
-    throw new Error("Missing WHISPER_PROXY_URL env var");
-  }
-
-  // Node 18+ has fetch/FormData/Blob available (undici)
-  const fd = new FormData();
-  // Whisper proxies commonly expect: field name "audio"
-  const blob = new Blob([audioBuffer], { type: mimetype || "application/octet-stream" });
-  fd.append("audio", blob, "speech." + (guessExt(mimetype) || "bin"));
-
-  const headers = {};
-  if (WHISPER_PROXY_SECRET) headers["x-whisper-secret"] = WHISPER_PROXY_SECRET;
-
-  const res = await fetch(WHISPER_PROXY_URL, {
-    method: "POST",
-    headers,
-    body: fd,
-  });
-
-  const txt = await res.text();
-  if (!res.ok) {
-    throw new Error(`Whisper proxy HTTP ${res.status}: ${txt}`);
-  }
-
-  // Try JSON first, then fallback to plain text
-  try {
-    const j = JSON.parse(txt);
-    // common shapes: {text:"..."} or {ok:true,text:"..."} or {transcript:"..."}
-    return String(j.text || j.transcript || j.result || "").trim();
-  } catch {
-    return String(txt || "").trim();
-  }
-}
-
-function guessExt(m) {
-  const s = String(m || "").toLowerCase();
-  if (s.includes("webm")) return "webm";
-  if (s.includes("ogg")) return "ogg";
-  if (s.includes("wav")) return "wav";
-  if (s.includes("mpeg") || s.includes("mp3")) return "mp3";
-  if (s.includes("mp4") || s.includes("aac")) return "m4a";
-  return "";
-}
-
-// ---------- Route: /pronounce ----------
+// ---- Core route ----
+// Expects multipart/form-data:
+// - targetText (string)  [e.g. "Danke"]
+// - language (string)    [e.g. "de-DE"]  (passed through to whisper proxy; depends on your proxy)
+// - audio (file)         field name MUST be "audio"
 app.post("/pronounce", upload.single("audio"), async (req, res) => {
   try {
+    // Secret check
     const clientSecret = req.headers["x-pronounce-secret"];
-    if (clientSecret !== PRONOUNCE_SECRET) {
+    if (String(clientSecret || "") !== PRONOUNCE_SECRET) {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
 
+    if (!WHISPER_PROXY_URL) {
+      return res.status(500).json({ ok: false, error: "Missing WHISPER_PROXY_URL env var" });
+    }
+
     const targetText = (req.body?.targetText || "").toString().trim();
-    const language = (req.body?.language || "").toString().trim(); // kept for compatibility
+    const language = (req.body?.language || "").toString().trim();
     const file = req.file;
 
     if (!targetText || !language || !file) {
@@ -157,43 +128,58 @@ app.post("/pronounce", upload.single("audio"), async (req, res) => {
       });
     }
 
-    const recognizedText = await transcribeWithWhisperProxy({
-      audioBuffer: file.buffer,
-      mimetype: file.mimetype,
-    });
+    // ---- Call Whisper proxy (your existing service) ----
+    // We send multipart with field name "audio" (common for whisper proxies).
+    const fd = new FormData();
+    fd.append("language", language);
+    // Many whisper proxies accept "model" or others; keep minimal.
+    const blob = new Blob([file.buffer], { type: file.mimetype || "application/octet-stream" });
+    fd.append("audio", blob, file.originalname || "speech.webm");
 
-    // STRICT: must match the target word
-    const strictOk = norm(recognizedText) === norm(targetText);
+    const wRes = await fetch(WHISPER_PROXY_URL, { method: "POST", body: fd });
+    const wTxt = await wRes.text();
+    let wJson = null;
+    try { wJson = JSON.parse(wTxt); } catch { wJson = null; }
 
-    // Score logic:
-    // - exact word => 100
-    // - else => 0
-    const overallScore = strictOk ? 100 : 0;
+    if (!wRes.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: "Whisper proxy failed",
+        status: wRes.status,
+        raw: wTxt?.slice(0, 800),
+      });
+    }
+
+    // Whisper proxy response shape varies; try common fields.
+    const transcript =
+      (wJson && (wJson.text || wJson.transcript || wJson.result || wJson.data?.text)) ||
+      (typeof wTxt === "string" ? wTxt : "");
+
+    const m = exactWordMatch(targetText, transcript);
+    const overallScore = m.ok ? 100 : 0;
+    const grade = m.ok ? "good" : "poor";
 
     return res.json({
       ok: true,
-      mode: "whisper_strict_match",
-      grade: gradeFrom(overallScore),
+      mode: "whisper_strict",
       overallScore,
-
-      strictOk,
-      recognizedText,
-      referenceText: targetText,
-
+      grade,
+      transcript: m.transcript || "",
+      tokens: m.tokens || [],
+      targetText,
+      language,
       file: {
         originalname: file.originalname,
         mimetype: file.mimetype,
         size: file.size,
       },
-
-      details: { targetText, language },
     });
   } catch (err) {
     console.error("[pronounce-backend] /pronounce error:", err);
-    res.status(500).json({ ok: false, error: String(err?.message || "Server error") });
+    res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v16_WHISPER_STRICT_MATCH)`);
+  console.log(`[pronounce-backend] listening on :${PORT} (DEPLOY_v16_WHISPER_STRICT)`);
 });
