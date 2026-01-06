@@ -1,6 +1,12 @@
 import express from "express";
 import multer from "multer";
-
+function norm(s){
+  return String(s||"")
+    .trim()
+    .toLowerCase()
+    .replace(/[.,!?;:"„“(){}\[\]<>]+$/g,"")
+    .replace(/\s+/g," ");
+}
 const app = express();
 
 /**
