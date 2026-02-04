@@ -44,30 +44,45 @@ function isAllowedOrigin(origin) {
   return allowedOrigins.includes(o);
 }
 
+
+
+
+
 /**
- * ✅ CORS ganz am Anfang
+ * ✅ CORS – STABIL, BROWSERKOMPATIBEL, OHNE WILDCARDS
  */
+const ALLOWED_ORIGIN = "https://pflege-deutsch.netlify.app";
+
 app.use((req, res, next) => {
-  const originRaw = req.headers.origin;
-  const origin = normOrigin(originRaw);
+  const origin = req.headers.origin;
 
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  // ✅ Allow-Headers erweitert (hilft bei Preflight in manchen Setups)
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-pronounce-secret, Authorization");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, x-pronounce-secret, Authorization"
+  );
+  res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Max-Age", "86400");
 
+  // server-to-server / health / curl
   if (!origin) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  } else if (isAllowedOrigin(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
+    return next();
+  }
+
+  if (origin === ALLOWED_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
   } else {
     return res.status(403).send("CORS blocked");
   }
 
-  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   next();
 });
+
 
 // ✅ Nur text/plain + json parsen (multipart wird von multer verarbeitet)
 app.use(express.text({ type: "text/plain", limit: "30mb" }));
