@@ -12,7 +12,7 @@ const app = express();
 /**
  * Marker hochsetzen, damit du in /health sofort siehst, dass es live ist.
  */
-const DEPLOY_MARKER = "DEPLOY_2026-01-04_v14_CORS_HEADERS_NO_STORE";
+const DEPLOY_MARKER = "DEPLOY_2026-07-12_v15_PHONEM_DIAG_ONLY";
 
 const {
   PORT = "8000",
@@ -186,6 +186,54 @@ function extractBest(json) {
   return nbest[0] || null;
 }
 
+/**
+ * Diagnosehilfe: Liest nur vorhandene Azure-Daten aus.
+ * Sie verändert weder Bewertung noch Bestehen/Nichtbestehen.
+ */
+function buildPhonemeDiagnostics(best) {
+  const words = Array.isArray(best?.Words) ? best.Words : [];
+
+  return words.map((word, wordIndex) => {
+    const phonemes = Array.isArray(word?.Phonemes) ? word.Phonemes : [];
+
+    return {
+      wordIndex,
+      word: String(word?.Word || word?.Lexical || ""),
+      accuracyScore: Number.isFinite(Number(word?.PronunciationAssessment?.AccuracyScore))
+        ? Number(word.PronunciationAssessment.AccuracyScore)
+        : null,
+      errorType: word?.PronunciationAssessment?.ErrorType ?? null,
+      phonemes: phonemes.map((phoneme, phonemeIndex) => ({
+        phonemeIndex,
+        phoneme: String(phoneme?.Phoneme || ""),
+        accuracyScore: Number.isFinite(Number(phoneme?.PronunciationAssessment?.AccuracyScore))
+          ? Number(phoneme.PronunciationAssessment.AccuracyScore)
+          : null,
+      })),
+    };
+  });
+}
+
+function shouldLogPhonemeDiagnostics(targetText) {
+  const target = norm(targetText);
+  return ["ich", "nicht", "möchten", "acht", "bach"].includes(target);
+}
+
+function logPhonemeDiagnostics(targetText, language, best) {
+  if (!shouldLogPhonemeDiagnostics(targetText)) return;
+
+  const payload = {
+    marker: DEPLOY_MARKER,
+    targetText,
+    language,
+    recognizedText: best?.Lexical || best?.Display || "",
+    pronunciationAssessment: best?.PronunciationAssessment || null,
+    words: buildPhonemeDiagnostics(best),
+  };
+
+  console.log("[PHONEM_DIAG]", JSON.stringify(payload));
+}
+
 /* -------------------------
    Ich/Ach Gate – Helper
 -------------------------- */
@@ -328,6 +376,7 @@ app.post("/pronounce", maybeUpload, async (req, res) => {
 
       const json = azure.body;
       const best = extractBest(json);
+      logPhonemeDiagnostics(targetText, language, best);
       const pa = best?.PronunciationAssessment || {};
 
       const accuracyScore = Number(pa?.AccuracyScore);
@@ -375,6 +424,10 @@ app.post("/pronounce", maybeUpload, async (req, res) => {
           },
           words: Array.isArray(best?.Words) ? best.Words : [],
           recognitionStatus: json?.RecognitionStatus ?? null,
+          diagnostics: {
+            marker: DEPLOY_MARKER,
+            words: buildPhonemeDiagnostics(best),
+          },
         },
       });
     }
@@ -415,6 +468,7 @@ app.post("/pronounce", maybeUpload, async (req, res) => {
 
     const json = azure.body;
     const best = extractBest(json);
+    logPhonemeDiagnostics(targetText, language, best);
     const pa = best?.PronunciationAssessment || {};
 
     const accuracyScore = Number(pa?.AccuracyScore);
@@ -462,6 +516,10 @@ app.post("/pronounce", maybeUpload, async (req, res) => {
         },
         words: Array.isArray(best?.Words) ? best.Words : [],
         recognitionStatus: json?.RecognitionStatus ?? null,
+          diagnostics: {
+            marker: DEPLOY_MARKER,
+            words: buildPhonemeDiagnostics(best),
+          },
       },
     });
   } catch (err) {
@@ -480,5 +538,4 @@ const PORT_NUM = Number(process.env.PORT || PORT || 8000);
 app.listen(PORT_NUM, "0.0.0.0", () => {
   console.log(`[pronounce-backend] listening on :${PORT_NUM} (${DEPLOY_MARKER})`);
 });
-
 
